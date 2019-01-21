@@ -1,0 +1,145 @@
+
+//此源码被清华学神尹成大魔王专业翻译分析并修改
+//尹成QQ77025077
+//尹成微信18510341407
+//尹成所在QQ群721929980
+//尹成邮箱 yinc13@mails.tsinghua.edu.cn
+//尹成毕业于清华大学,微软区块链领域全球最有价值专家
+//https://mvp.microsoft.com/zh-cn/PublicProfile/4033620
+/*
+版权所有IBM公司。保留所有权利。
+
+SPDX许可证标识符：Apache-2.0
+**/
+
+
+package deliver_test
+
+import (
+	"time"
+
+	"github.com/hyperledger/fabric/common/deliver"
+	"github.com/hyperledger/fabric/common/deliver/mock"
+	cb "github.com/hyperledger/fabric/protos/common"
+	"github.com/hyperledger/fabric/protos/utils"
+	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/gomega"
+	"github.com/pkg/errors"
+)
+
+var _ = Describe("SessionAccessControl", func() {
+	var (
+		fakeChain         *mock.Chain
+		envelope          *cb.Envelope
+		fakePolicyChecker *mock.PolicyChecker
+		expiresAt         deliver.ExpiresAtFunc
+	)
+
+	BeforeEach(func() {
+		envelope = &cb.Envelope{
+			Payload: utils.MarshalOrPanic(&cb.Payload{
+				Header: &cb.Header{},
+			}),
+		}
+
+		fakeChain = &mock.Chain{}
+		fakePolicyChecker = &mock.PolicyChecker{}
+		expiresAt = func([]byte) time.Time { return time.Time{} }
+	})
+
+	It("evaluates the policy", func() {
+		sac, err := deliver.NewSessionAC(fakeChain, envelope, fakePolicyChecker, "chain-id", expiresAt)
+		Expect(err).NotTo(HaveOccurred())
+
+		err = sac.Evaluate()
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(fakePolicyChecker.CheckPolicyCallCount()).To(Equal(1))
+		env, cid := fakePolicyChecker.CheckPolicyArgsForCall(0)
+		Expect(env).To(Equal(envelope))
+		Expect(cid).To(Equal("chain-id"))
+	})
+
+	Context("when policy evaluation returns an error", func() {
+		BeforeEach(func() {
+			fakePolicyChecker.CheckPolicyReturns(errors.New("no-access-for-you"))
+		})
+
+		It("returns the evaluation error", func() {
+			sac, err := deliver.NewSessionAC(fakeChain, envelope, fakePolicyChecker, "chain-id", expiresAt)
+			Expect(err).NotTo(HaveOccurred())
+
+			err = sac.Evaluate()
+			Expect(err).To(MatchError("no-access-for-you"))
+		})
+	})
+
+	It("caches positive policy evaluation", func() {
+		sac, err := deliver.NewSessionAC(fakeChain, envelope, fakePolicyChecker, "chain-id", expiresAt)
+		Expect(err).NotTo(HaveOccurred())
+
+		for i := 0; i < 5; i++ {
+			err = sac.Evaluate()
+			Expect(err).NotTo(HaveOccurred())
+		}
+		Expect(fakePolicyChecker.CheckPolicyCallCount()).To(Equal(1))
+	})
+
+	Context("when the config sequence changes", func() {
+		BeforeEach(func() {
+			fakePolicyChecker.CheckPolicyReturnsOnCall(2, errors.New("access-now-denied"))
+		})
+
+		It("re-evaluates the policy", func() {
+			sac, err := deliver.NewSessionAC(fakeChain, envelope, fakePolicyChecker, "chain-id", expiresAt)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(sac.Evaluate()).To(Succeed())
+			Expect(fakePolicyChecker.CheckPolicyCallCount()).To(Equal(1))
+			Expect(sac.Evaluate()).To(Succeed())
+			Expect(fakePolicyChecker.CheckPolicyCallCount()).To(Equal(1))
+
+			fakeChain.SequenceReturns(2)
+			Expect(sac.Evaluate()).To(Succeed())
+			Expect(fakePolicyChecker.CheckPolicyCallCount()).To(Equal(2))
+			Expect(sac.Evaluate()).To(Succeed())
+			Expect(fakePolicyChecker.CheckPolicyCallCount()).To(Equal(2))
+
+			fakeChain.SequenceReturns(3)
+			Expect(sac.Evaluate()).To(MatchError("access-now-denied"))
+			Expect(fakePolicyChecker.CheckPolicyCallCount()).To(Equal(3))
+		})
+	})
+
+	Context("when an identity expires", func() {
+		BeforeEach(func() {
+			expiresAt = func([]byte) time.Time {
+				return time.Now().Add(250 * time.Millisecond)
+			}
+		})
+
+		It("returns an identity expired error", func() {
+			sac, err := deliver.NewSessionAC(fakeChain, envelope, fakePolicyChecker, "chain-id", expiresAt)
+			Expect(err).NotTo(HaveOccurred())
+
+			err = sac.Evaluate()
+			Expect(err).NotTo(HaveOccurred())
+
+			Eventually(sac.Evaluate).Should(MatchError(ContainSubstring("client identity expired")))
+		})
+	})
+
+	Context("when the envelope cannot be represented as signed data", func() {
+		BeforeEach(func() {
+			envelope = &cb.Envelope{}
+		})
+
+		It("returns an error", func() {
+			_, expectedError := envelope.AsSignedData()
+			Expect(expectedError).To(HaveOccurred())
+
+			_, err := deliver.NewSessionAC(fakeChain, envelope, fakePolicyChecker, "chain-id", expiresAt)
+			Expect(err).To(Equal(expectedError))
+		})
+	})
+})

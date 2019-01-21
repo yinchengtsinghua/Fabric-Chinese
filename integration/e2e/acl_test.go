@@ -1,0 +1,303 @@
+
+//此源码被清华学神尹成大魔王专业翻译分析并修改
+//尹成QQ77025077
+//尹成微信18510341407
+//尹成所在QQ群721929980
+//尹成邮箱 yinc13@mails.tsinghua.edu.cn
+//尹成毕业于清华大学,微软区块链领域全球最有价值专家
+//https://mvp.microsoft.com/zh-cn/PublicProfile/4033620
+/*
+版权所有IBM公司保留所有权利。
+
+SPDX许可证标识符：Apache-2.0
+**/
+
+
+package e2e
+
+import (
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"os"
+	"path/filepath"
+	"syscall"
+	"time"
+
+	docker "github.com/fsouza/go-dockerclient"
+	"github.com/golang/protobuf/proto"
+	"github.com/hyperledger/fabric/core/aclmgmt/resources"
+	"github.com/hyperledger/fabric/integration/nwo"
+	"github.com/hyperledger/fabric/integration/nwo/commands"
+	"github.com/hyperledger/fabric/protos/common"
+	pb "github.com/hyperledger/fabric/protos/peer"
+	"github.com/hyperledger/fabric/protos/utils"
+	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/gomega"
+	"github.com/onsi/gomega/gbytes"
+	"github.com/onsi/gomega/gexec"
+	"github.com/tedsuo/ifrit"
+)
+
+var _ = Describe("EndToEndACL", func() {
+	var (
+		testDir   string
+		client    *docker.Client
+		network   *nwo.Network
+		chaincode nwo.Chaincode
+		process   ifrit.Process
+
+		orderer   *nwo.Orderer
+		org1Peer0 *nwo.Peer
+		org2Peer0 *nwo.Peer
+	)
+
+	BeforeEach(func() {
+		var err error
+		testDir, err = ioutil.TempDir("", "acl-e2e")
+		Expect(err).NotTo(HaveOccurred())
+
+		client, err = docker.NewClientFromEnv()
+		Expect(err).NotTo(HaveOccurred())
+
+//通过减少同龄人的数量来加速测试
+//打开并安装链码至。
+		soloConfig := nwo.BasicSolo()
+		soloConfig.RemovePeer("Org1", "peer1")
+		soloConfig.RemovePeer("Org2", "peer1")
+		Expect(soloConfig.Peers).To(HaveLen(2))
+
+		network = nwo.New(soloConfig, testDir, client, BasePort(), components)
+		network.GenerateConfigTree()
+		network.Bootstrap()
+
+		networkRunner := network.NetworkGroupRunner()
+		process = ifrit.Invoke(networkRunner)
+		Eventually(process.Ready(), network.EventuallyTimeout).Should(BeClosed())
+
+		orderer = network.Orderer("orderer")
+		org1Peer0 = network.Peer("Org1", "peer0")
+		org2Peer0 = network.Peer("Org2", "peer0")
+
+		chaincode = nwo.Chaincode{
+			Name:    "mycc",
+			Version: "0.0",
+			Path:    "github.com/hyperledger/fabric/integration/chaincode/simple/cmd",
+			Ctor:    `{"Args":["init","a","100","b","200"]}`,
+			Policy:  `OR ('Org1MSP.member','Org2MSP.member')`,
+		}
+		network.CreateAndJoinChannel(orderer, "testchannel")
+		nwo.DeployChaincode(network, "testchannel", orderer, chaincode)
+	})
+
+	AfterEach(func() {
+		process.Signal(syscall.SIGTERM)
+		Eventually(process.Wait(), network.EventuallyTimeout).Should(Receive())
+		network.Cleanup()
+		os.RemoveAll(testDir)
+	})
+
+	It("enforces access control list policies", func() {
+		invokeChaincode := commands.ChaincodeInvoke{
+			ChannelID:    "testchannel",
+			Orderer:      network.OrdererAddress(orderer, nwo.ListenPort),
+			Name:         chaincode.Name,
+			Ctor:         `{"Args":["invoke","a","b","10"]}`,
+			WaitForEvent: true,
+		}
+
+		outputBlock := filepath.Join(testDir, "newest_block.pb")
+		fetchNewest := commands.ChannelFetch{
+			ChannelID:  "testchannel",
+			Block:      "newest",
+			OutputFile: outputBlock,
+		}
+
+//
+//当deliverfiltered的acl策略满足时
+//
+		By("setting the filtered block event ACL policy to Org1/Admins")
+		policyName := resources.Event_FilteredBlock
+		policy := "/Channel/Application/Org1/Admins"
+		SetACLPolicy(network, "testchannel", policyName, policy, "orderer")
+
+		By("invoking chaincode as a permitted Org1 Admin identity")
+		sess, err := network.PeerAdminSession(org1Peer0, invokeChaincode)
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(sess.Err, network.EventuallyTimeout).Should(gbytes.Say("Chaincode invoke successful. result: status:200"))
+
+//
+//当deliverfiltered的acl策略不满足时
+//
+		By("setting the filtered block event ACL policy to org2/Admins")
+		policyName = resources.Event_FilteredBlock
+		policy = "/Channel/Application/org2/Admins"
+		SetACLPolicy(network, "testchannel", policyName, policy, "orderer")
+
+		By("invoking chaincode as a forbidden Org1 Admin identity")
+		sess, err = network.PeerAdminSession(org1Peer0, invokeChaincode)
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(sess.Err, network.EventuallyTimeout).Should(gbytes.Say(`\Qdeliver completed with status (FORBIDDEN)\E`))
+
+//
+//当满足用于传递的ACL策略时
+//
+		By("setting the block event ACL policy to Org1/Admins")
+		policyName = resources.Event_Block
+		policy = "/Channel/Application/Org1/Admins"
+		SetACLPolicy(network, "testchannel", policyName, policy, "orderer")
+
+		By("fetching the latest block from the peer as a permitted Org1 Admin identity")
+		sess, err = network.PeerAdminSession(org1Peer0, fetchNewest)
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(sess, network.EventuallyTimeout).Should(gexec.Exit(0))
+		Expect(sess.Err).To(gbytes.Say("Received block: "))
+
+//
+//当用于传递的ACL策略不满足时
+//
+		By("fetching the latest block from the peer as a forbidden org2 Admin identity")
+		sess, err = network.PeerAdminSession(org2Peer0, fetchNewest)
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(sess, network.EventuallyTimeout).Should(gexec.Exit())
+		Expect(sess.Err).To(gbytes.Say("can't read the block: &{FORBIDDEN}"))
+
+//
+//满足lscc/getinstantedchaincodes的acl策略时
+//
+		By("setting the lscc/GetInstantiatedChaincodes ACL policy to Org1/Admins")
+		policyName = resources.Lscc_GetInstantiatedChaincodes
+		policy = "/Channel/Application/Org1/Admins"
+		SetACLPolicy(network, "testchannel", policyName, policy, "orderer")
+
+		By("listing the instantiated chaincodes as a permitted Org1 Admin identity")
+		sess, err = network.PeerAdminSession(org1Peer0, commands.ChaincodeListInstantiated{
+			ChannelID: "testchannel",
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(sess, network.EventuallyTimeout).Should(gexec.Exit(0))
+		Expect(sess).To(gbytes.Say("Name: mycc, Version: 0.0, Path: .*, Escc: escc, Vscc: vscc"))
+
+//
+//当lscc/getinstantatedchaincodes的acl策略不满足时
+//
+		By("listing the instantiated chaincodes as a forbidden org2 Admin identity")
+		sess, err = network.PeerAdminSession(org2Peer0, commands.ChaincodeListInstantiated{
+			ChannelID: "testchannel",
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(sess, network.EventuallyTimeout).Should(gexec.Exit())
+		Expect(sess).NotTo(gbytes.Say("Name: mycc, Version: 0.0, Path: .*, Escc: escc, Vscc: vscc"))
+		Expect(sess.Err).To(gbytes.Say(`access denied for \[getchaincodes\]\[testchannel\](.*)signature set did not satisfy policy`))
+
+//
+//设置系统链代码ACL策略并执行查询时
+//
+
+//从分类帐中的块获取交易记录ID
+		sess, err = network.PeerAdminSession(org1Peer0, fetchNewest)
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(sess, network.EventuallyTimeout).Should(gexec.Exit(0))
+		Expect(sess.Err).To(gbytes.Say("Received block: "))
+		txID := GetTxIDFromBlockFile(outputBlock)
+
+		ItEnforcesPolicy := func(scc, operation string, args ...string) {
+			policyName := fmt.Sprintf("%s/%s", scc, operation)
+			policy := "/Channel/Application/Org1/Admins"
+			By("setting " + policyName + " to Org1 Admins")
+			SetACLPolicy(network, "testchannel", policyName, policy, "orderer")
+
+			args = append([]string{operation}, args...)
+			chaincodeQuery := commands.ChaincodeQuery{
+				ChannelID: "testchannel",
+				Name:      scc,
+				Ctor:      ToCLIChaincodeArgs(args...),
+			}
+
+			By("evaluating " + policyName + " for a permitted subject")
+			sess, err := network.PeerAdminSession(org1Peer0, chaincodeQuery)
+			Expect(err).NotTo(HaveOccurred())
+			Eventually(sess, 30*time.Second).Should(gexec.Exit(0))
+
+			By("evaluating " + policyName + " for a forbidden subject")
+			sess, err = network.PeerAdminSession(org2Peer0, chaincodeQuery)
+			Expect(err).NotTo(HaveOccurred())
+			Eventually(sess, 30*time.Second).Should(gexec.Exit())
+			Expect(sess.Err).To(gbytes.Say(fmt.Sprintf(`access denied for \[%s\]\[%s\](.*)signature set did not satisfy policy`, operation, "testchannel")))
+		}
+
+//
+//QSCC
+//
+		ItEnforcesPolicy("qscc", "GetChainInfo", "testchannel")
+		ItEnforcesPolicy("qscc", "GetBlockByNumber", "testchannel", "0")
+		ItEnforcesPolicy("qscc", "GetBlockByTxID", "testchannel", txID)
+		ItEnforcesPolicy("qscc", "GetTransactionByID", "testchannel", txID)
+
+//
+//LSCC
+//
+		ItEnforcesPolicy("lscc", "GetChaincodeData", "testchannel", "mycc")
+		ItEnforcesPolicy("lscc", "ChaincodeExists", "testchannel", "mycc")
+
+//
+//CSCC
+//
+		ItEnforcesPolicy("cscc", "GetConfigBlock", "testchannel")
+		ItEnforcesPolicy("cscc", "GetConfigTree", "testchannel")
+	})
+})
+
+//setaclpolicy为正在运行的网络设置acl策略。它重置所有
+//以前定义的ACL策略，生成配置更新，签名
+//使用org2的签名者进行配置，然后使用
+//Org1
+func SetACLPolicy(network *nwo.Network, channel, policyName, policy string, ordererName string) {
+	orderer := network.Orderer(ordererName)
+	submitter := network.Peer("Org1", "peer0")
+	signer := network.Peer("Org2", "peer0")
+
+	config := nwo.GetConfigBlock(network, submitter, orderer, channel)
+	updatedConfig := proto.Clone(config).(*common.Config)
+
+//制定政策
+	updatedConfig.ChannelGroup.Groups["Application"].Values["ACLs"] = &common.ConfigValue{
+		ModPolicy: "Admins",
+		Value: utils.MarshalOrPanic(&pb.ACLs{
+			Acls: map[string]*pb.APIResource{
+				policyName: {PolicyRef: policy},
+			},
+		}),
+	}
+
+	nwo.UpdateConfig(network, orderer, channel, config, updatedConfig, submitter, signer)
+}
+
+//gettXidFromBlock从已
+//在文件系统上封送和存储
+func GetTxIDFromBlockFile(blockFile string) string {
+	block := nwo.UnmarshalBlockFromFile(blockFile)
+
+	envelope, err := utils.GetEnvelopeFromBlock(block.Data.Data[0])
+	Expect(err).NotTo(HaveOccurred())
+
+	payload, err := utils.GetPayload(envelope)
+	Expect(err).NotTo(HaveOccurred())
+
+	chdr, err := utils.UnmarshalChannelHeader(payload.Header.ChannelHeader)
+	Expect(err).NotTo(HaveOccurred())
+
+	return chdr.TxId
+}
+
+//toclichaincodeargs将字符串参数转换为用于chaincode调用的参数
+//从CLI。
+func ToCLIChaincodeArgs(args ...string) string {
+	type cliArgs struct {
+		Args []string
+	}
+	cArgs := &cliArgs{Args: args}
+	cArgsJSON, err := json.Marshal(cArgs)
+	Expect(err).NotTo(HaveOccurred())
+	return string(cArgsJSON)
+}
